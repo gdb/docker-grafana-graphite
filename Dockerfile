@@ -1,22 +1,21 @@
-FROM   alpine
+# ---
+# build_root: .
+# include:
+#  - '*'
+# ---
+
+FROM   ubuntu:16.04
 
 # ---------------- #
 #   Installation   #
 # ---------------- #
 
 # Install all prerequisites
-RUN     apk add --update --no-cache nginx nodejs nodejs-npm git curl wget gcc ca-certificates \
-                                    python-dev py-pip musl-dev libffi-dev cairo supervisor bash \
-                                    py-pyldap py-rrd                                                                 &&\
-        wget -q -O /etc/apk/keys/sgerrand.rsa.pub \
-                    https://raw.githubusercontent.com/sgerrand/alpine-pkg-glibc/master/sgerrand.rsa.pub              &&\
-        wget https://github.com/sgerrand/alpine-pkg-glibc/releases/download/2.26-r0/glibc-2.26-r0.apk                &&\
-        apk add --no-cache  glibc-2.26-r0.apk                                                                        &&\
-        rm glibc-2.26-r0.apk                                                                                         &&\
-        adduser -D -u 1000 -g 'www' www                                                                              &&\
-        pip install -U pip pytz gunicorn six --no-cache-dir                                                          &&\
-        npm install -g wizzy                                                                                         &&\
-        npm cache clean --force
+RUN     apt-get update && apt-get -y install nginx supervisor git python-pip libffi-dev libcairo2-dev autoconf libtool check curl npm nodejs-legacy gunicorn &&\
+	rm -rf /var/lib/apt/lists/*
+RUN npm install -g wizzy &&\
+    npm cache clean --force
+RUN pip install futures --no-cache-dir
 
 # Checkout the master branches of Graphite, Carbon and Whisper and install from there
 RUN     mkdir /src                                                                                                   &&\
@@ -25,10 +24,9 @@ RUN     mkdir /src                                                              
         pip install . --no-cache-dir                                                                                 &&\
         python setup.py install
 
-RUN     git clone --depth=1 --branch master https://github.com/graphite-project/carbon.git /src/carbon               &&\
-        cd /src/carbon                                                                                               &&\
-        pip install . --no-cache-dir                                                                                 &&\
-        python setup.py install
+RUN cd /tmp &&\
+    curl -Lo go-carbon.deb https://github.com/lomik/go-carbon/releases/download/v0.11.0/go-carbon_0.11.0_amd64.deb &&\
+    dpkg -i go-carbon.deb
 
 RUN     git clone --depth=1 --branch master https://github.com/graphite-project/graphite-web.git /src/graphite-web   &&\
         cd /src/graphite-web                                                                                         &&\
@@ -37,8 +35,12 @@ RUN     git clone --depth=1 --branch master https://github.com/graphite-project/
         pip install -r requirements.txt --no-cache-dir                                                               &&\
         python check-dependencies.py
 
-# Install StatsD
-RUN     git clone --depth=1 --branch master https://github.com/etsy/statsd.git /src/statsd
+RUN git clone --depth=1 --branch master https://github.com/statsite/statsite /src/statsite &&\
+    cd /src/statsite &&\
+    ./autogen.sh &&\
+    ./configure && \
+    make &&\
+    make install
 
 # Install Grafana
 RUN     mkdir /src/grafana                                                                                           &&\
@@ -48,34 +50,39 @@ RUN     mkdir /src/grafana                                                      
         tar -xzf /src/grafana.tar.gz -C /opt/grafana --strip-components=1                                            &&\
         rm /src/grafana.tar.gz
 
+# Install carbon-c-relay
+RUN git clone https://github.com/grobian/carbon-c-relay /src/carbon-c-relay &&\
+  cd /src/carbon-c-relay &&\
+  ./configure &&\
+  make
 
 # Cleanup Compile Dependencies
-RUN     apk del --no-cache git curl wget gcc python-dev musl-dev libffi-dev
+RUN     apt-get purge -y git gcc python-dev libffi-dev
 
 
 # ----------------- #
 #   Configuration   #
 # ----------------- #
 
-# Confiure StatsD
-ADD     ./statsd/config.js /src/statsd/config.js
+# Configure statsite
+COPY     ./statsite/statsite.conf /src/statsite/statsite.conf
 
 # Configure Whisper, Carbon and Graphite-Web
-ADD     ./graphite/initial_data.json /opt/graphite/webapp/graphite/initial_data.json
-ADD     ./graphite/local_settings.py /opt/graphite/webapp/graphite/local_settings.py
-ADD     ./graphite/carbon.conf /opt/graphite/conf/carbon.conf
-ADD     ./graphite/storage-schemas.conf /opt/graphite/conf/storage-schemas.conf
-ADD     ./graphite/storage-aggregation.conf /opt/graphite/conf/storage-aggregation.conf
+COPY     ./graphite/initial_data.json /opt/graphite/webapp/graphite/initial_data.json
+COPY     ./graphite/local_settings.py /opt/graphite/webapp/graphite/local_settings.py
+COPY     ./graphite/carbon.conf /opt/graphite/conf/carbon.conf
+COPY     ./graphite/storage-schemas.conf /opt/graphite/conf/storage-schemas.conf
+COPY     ./graphite/storage-aggregation.conf /opt/graphite/conf/storage-aggregation.conf
 RUN     mkdir -p /opt/graphite/storage/whisper                                                                       &&\
         touch /opt/graphite/storage/graphite.db /opt/graphite/storage/index                                          &&\
-        chown -R www /opt/graphite/storage                                                                           &&\
+        chown -R www-data /opt/graphite/storage                                                                           &&\
         chmod 0775 /opt/graphite/storage /opt/graphite/storage/whisper                                               &&\
         chmod 0664 /opt/graphite/storage/graphite.db                                                                 &&\
         cp /src/graphite-web/webapp/manage.py /opt/graphite/webapp                                                   &&\
         cd /opt/graphite/webapp/ && python manage.py migrate --run-syncdb --noinput
 
 # Configure Grafana and wizzy
-ADD     ./grafana/custom.ini /opt/grafana/conf/custom.ini
+COPY     ./grafana/custom.ini /opt/grafana/conf/custom.ini
 RUN     cd /src                                                                                                      &&\
         wizzy init                                                                                                   &&\
         extract() { cat /opt/grafana/conf/custom.ini | grep $1 | awk '{print $NF}'; }                                &&\
@@ -83,17 +90,21 @@ RUN     cd /src                                                                 
         wizzy set grafana username $(extract ";admin_user")                                                          &&\
         wizzy set grafana password $(extract ";admin_password")
 
+# Configure carbon-c-relay
+COPY     ./carbon-c-relay/carbon-c-relay.conf /etc/carbon-c-relay/carbon-c-relay.conf
+
 # Add the default datasource and dashboards
 RUN 	mkdir /src/datasources                                                                                       &&\
         mkdir /src/dashboards
-ADD     ./grafana/datasources/* /src/datasources
-ADD     ./grafana/dashboards/* /src/dashboards/
-ADD     ./grafana/export-datasources-and-dashboards.sh /src/
+COPY     ./grafana/datasources/* /src/datasources
+COPY     ./grafana/dashboards/* /src/dashboards/
+COPY     ./grafana/export-datasources-and-dashboards.sh /src/
 
 # Configure nginx and supervisord
-ADD     ./nginx/nginx.conf /etc/nginx/nginx.conf
-RUN     mkdir /var/log/supervisor
-ADD     ./supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+COPY     ./nginx/nginx.conf /etc/nginx/nginx.conf
+COPY     ./supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+
+COPY go-carbon/go-carbon.conf /etc/go-carbon/go-carbon.conf
 
 
 # ---------------- #
@@ -103,10 +114,10 @@ ADD     ./supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 # Grafana
 EXPOSE  80
 
-# StatsD UDP port
+# statsite UDP port
 EXPOSE  8125/udp
 
-# StatsD Management port
+# statsite Management port
 EXPOSE  8126
 
 # Graphite web port
@@ -114,7 +125,6 @@ EXPOSE 81
 
 # Graphite Carbon port
 EXPOSE 2003
-
 
 # -------- #
 #   Run!   #
